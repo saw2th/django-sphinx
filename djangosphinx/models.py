@@ -1,3 +1,4 @@
+import sys
 import select
 import socket
 import time
@@ -191,7 +192,8 @@ def to_sphinx(value):
     return int(value)
 
 class SphinxQuerySet(object):
-    available_kwargs = ('rankmode', 'mode', 'weights', 'maxmatches', 'passages', 'passages_opts')
+    available_kwargs = ('rankmode', 'mode', 'weights', 'maxmatches',
+                        'passages', 'passages_opts', 'limit')
     
     def __init__(self, model=None, using=None, **kwargs):
         self._select_related        = False
@@ -201,9 +203,10 @@ class SphinxQuerySet(object):
         self._excludes              = {}
         self._extra                 = {}
         self._query                 = ''
+        self._select                = ''
         self.__metadata             = None
         self._offset                = 0
-        self._limit                 = 20
+        self._limit                 = getattr(settings, 'SPHINX_LIMIT', 20)
 
         self._groupby               = None
         self._sort                  = None
@@ -229,6 +232,10 @@ class SphinxQuerySet(object):
             self._index             = kwargs.get('index', model._meta.db_table)
         else:
             self._index             = kwargs.get('index')
+            
+        if not self._limit:
+            self._limit = sys.maxint
+        self._maxmatches = self._limit < 1000 and 1000 or self._limit
 
     def __repr__(self):
         if self._result_cache is not None:
@@ -326,6 +333,9 @@ class SphinxQuerySet(object):
         assert sphinxapi.VER_COMMAND_SEARCH >= 0x113, "You must upgrade sphinxapi to version 0.98 to use Geo Anchoring."
         return self._clone(_anchor=(lat_attr, lng_attr, float(lat), float(lng)))
 
+    def select(self, select_str):
+        return self._clone(_select=select_str)
+    
     # this actually does nothing, its just a passthru to
     # keep things looking/working generally the same
     def all(self):
@@ -496,6 +506,9 @@ class SphinxQuerySet(object):
             params.append('filters=%s' % (self._filters,))
             _handle_filters(self._filters)
 
+        if self._select:
+            client.SetSelect(self._select)
+            
         # Exclude filters
         if self._excludes:
             params.append('excludes=%s' % (self._excludes,))
@@ -532,6 +545,20 @@ class SphinxQuerySet(object):
 
         if not results:
             if client.GetLastError():
+                # Setting max_matches according to searchd max_matches
+                if ('out of bounds (per-server max_matches='
+                in client.GetLastError()):
+                    max_matches = int(re.search(
+                                        r"max_matches=(\d+)\)",
+                                        client.GetLastError()).group(1))
+                    logging.warning(
+                        "Your max_matches value in sphinx.conf is %s but "
+                        "django-sphinx is using %s."
+                        % (max_matches, self._maxmatches))
+                    settings.SPHINX_LIMIT = max_matches
+                    self._limit = max_matches
+                    self._maxmatches = max_matches
+                    return self._get_sphinx_results()
                 raise SearchError, client.GetLastError()
             elif client.GetLastWarning():
                 raise SearchError, client.GetLastWarning()
@@ -541,7 +568,6 @@ class SphinxQuerySet(object):
             results = EMPTY_RESULT_SET
         
         logging.debug('Found %s results for search query %s on %s with params: %s', results['total'], self._query, self._index, ', '.join(params))
-        
         return results
     
     def get(self, **kwargs):
@@ -567,7 +593,6 @@ class SphinxQuerySet(object):
             # XXX: The passages implementation has a potential gotcha if your id
             # column is not actually your primary key
             words = ' '.join([w['word'] for w in results['words']])
-            
         if self.model:
             if results['matches']:
                 queryset = self.get_query_set(self.model)
@@ -616,16 +641,16 @@ class SphinxQuerySet(object):
                     r['id'] = unicode(r['id'])
                     objcache.setdefault(ct, {})[r['id']] = None
                 for ct in objcache:
+                    
                     model_class = ContentType.objects.get(pk=ct).model_class()
                     pks = getattr(model_class._meta, 'pks', [model_class._meta.pk])
-                    
-                    if results['matches'][0]['attrs'].get(pks[0].column):
+                    print pks[0].column.lower(), results['matches'][0]['attrs']
+                    if results['matches'][0]['attrs'].get(pks[0].column.lower()):
                         for r in results['matches']:
                             if r['attrs']['content_type'] == ct:
-                                val = ', '.join([unicode(r['attrs'][p.column]) for p in pks])
+                                val = ', '.join([unicode(r['attrs'][p.column.lower()]) for p in pks])
                                 objcache[ct][r['id']] = r['id'] = val
-                    
-                        q = reduce(operator.or_, [reduce(operator.and_, [Q(**{p.name: r['attrs'][p.column]}) for p in pks]) for r in results['matches'] if r['attrs']['content_type'] == ct])
+                        q = reduce(operator.or_, [reduce(operator.and_, [Q(**{p.name: r['attrs'][p.column.lower()]}) for p in pks]) for r in results['matches'] if r['attrs']['content_type'] == ct])
                         queryset = self.get_query_set(model_class).filter(q)
                     else:
                         queryset = self.get_query_set(model_class).filter(pk__in=[r['id'] for r in results['matches'] if r['attrs']['content_type'] == ct])
@@ -645,17 +670,33 @@ class SphinxQuerySet(object):
         return results
 
     def _get_passages(self, instance, fields, words):
+
+        if instance is None:
+            return {}
+        
         client = self._get_sphinx_client()
 
         docs = [getattr(instance, f) for f in fields]
+
+        #Checks if any of the items in 'docs' list are neither strings nor unicode 
+        #objects. Upon finding such ones, converts them to strings with repr()
+        #function and replaces the original value with the converted one.
+        for index, doc in enumerate(docs):
+            if (not (isinstance(doc, str)) and (not isinstance(doc, unicode))):
+                docs[index] = repr(doc)
+            if isinstance(docs[index], unicode):
+                docs[index] = docs[index].encode('utf-8')
+
         if isinstance(self._passages_opts, dict):
             opts = self._passages_opts
         else:
             opts = {}
         if isinstance(self._index, unicode):
             self._index = self._index.encode('utf-8')
+        # HACK: so that passages works with more than one index
+        # take the first index only 
+        self._index = self._index.split(' ')[0]
         passages_list = client.BuildExcerpts(docs, self._index, words, opts)
-        
         passages = {}
         c = 0
         for f in fields:
@@ -704,9 +745,17 @@ class SphinxInstanceManager(object):
         self._instance = instance
         self._index = index
         
+    def _get_sphinx_client(self):
+        client = sphinxapi.SphinxClient()
+        client.SetServer(SPHINX_SERVER, SPHINX_PORT)
+        return client
+
     def update(self, **kwargs):
         assert sphinxapi.VER_COMMAND_SEARCH >= 0x113, "You must upgrade sphinxapi to version 0.98 to use UpdateAttributes."
-        sphinxapi.UpdateAttributes(self._index, kwargs.keys(), dict(self.instance.pk, map(to_sphinx, kwargs.values())))
+        attributes = {}
+        attributes[int(self._instance.pk)] = map(to_sphinx, kwargs.values())
+        client = self._get_sphinx_client()
+        client.UpdateAttributes(self._index, kwargs.keys(), attributes)
 
 class SphinxSearch(object):
     def __init__(self, index=None, using=None, **kwargs):
