@@ -644,7 +644,7 @@ class SphinxQuerySet(object):
                     
                     model_class = ContentType.objects.get(pk=ct).model_class()
                     pks = getattr(model_class._meta, 'pks', [model_class._meta.pk])
-                    print pks[0].column.lower(), results['matches'][0]['attrs']
+                    
                     if results['matches'][0]['attrs'].get(pks[0].column.lower()):
                         for r in results['matches']:
                             if r['attrs']['content_type'] == ct:
