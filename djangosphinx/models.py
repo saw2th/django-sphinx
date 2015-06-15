@@ -451,7 +451,7 @@ class SphinxQuerySet(object):
         params.append('weights=%s' % (self._weights,))
 
         params.append('matchmode=%s' % (self._mode,))
-        client.SetMatchMode(self._mode)
+        # client.SetMatchMode(self._mode)
         
         def _handle_filters(filter_list, exclude=False):
             for name, values in filter_list.iteritems():
